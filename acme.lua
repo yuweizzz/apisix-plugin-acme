@@ -18,12 +18,18 @@
 --
 
 
+local require = require
+
+local ngx_process = require("ngx.process")
 local ngx_timer_every = ngx.timer.every
 
-local require = require
+local acme = require("resty.acme.client")
+local util = require("resty.acme.util")
+local x509 = require("resty.openssl.x509")
+
 local core = require("apisix.core")
 local plugin = require("apisix.plugin")
-local acme = require("resty.acme.client")
+
 
 local plugin_name = "acme"
 
@@ -32,16 +38,13 @@ local metadata_schema = {
     properties = {
         api_uri = {
             type = "string",
-            minLength = 1,
             default = "https://acme-v02.api.letsencrypt.org/directory",
         },
         account_email = {
             type = "string",
-            minLength = 1,
         },
         account_key = {
             type = "string",
-            minLength = 1,
         },
         account_kid = {
             type = "string",
@@ -53,6 +56,7 @@ local metadata_schema = {
             type = "string",
         },
     },
+    required = {"account_email"},
 }
 
 local plugin_schema = {
@@ -88,6 +92,10 @@ function _M.init()
     core.schema.ssl.properties.acme = {
         type = "object",
         properties = {
+            acme_enabled = {
+                type = "boolean",
+                default = false,
+            },
             challenge_handler = {
                 type = "string",
                 default = "http-01",
@@ -96,6 +104,45 @@ function _M.init()
         }
     }
 end
+
+
+local function init_account()
+    local metadata = plugin.plugin_metadata(plugin_name)
+    if not metadata or not metadata.value then
+        return 400, { error_msg = "plugin metadata for acme is required" }
+    end
+
+    local config = metadata.value
+    if not config.account_key then
+        config.account_key = util.create_pkey(4096, "RSA")
+    end
+    if not config.account_kid then
+        -- storage in shm
+        local client, err = acme.new(config)
+        if not client then
+            return 500, { error_msg = err }
+        end
+    	err = client:init()
+        if err then
+            return 500, { error_msg = err }
+        end
+        config.account_kid = client:new_account()
+        return 200, config
+    end
+    return 304, { error_msg = "plugin metadata for acme already initialized" }
+end
+
+
+function _M.control_api()
+    return {
+        {
+            methods = {"POST"},
+            uris = {"/v1/plugin/acme/init"},
+            handler = init_account,
+        },
+    }
+end
+
 
 function _M.destroy()
     core.schema.ssl.properties.acme = nil
