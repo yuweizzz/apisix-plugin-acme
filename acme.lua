@@ -32,6 +32,7 @@ local plugin = require("apisix.plugin")
 
 
 local plugin_name = "acme"
+local acme_cache = ngx.shared[plugin_name]
 
 local metadata_schema = {
     type = "object",
@@ -54,6 +55,16 @@ local metadata_schema = {
         },
         eab_hmac_key = {
             type = "string",
+        },
+        renew_threshold = {
+            type = "number",
+            default = 7 * 86400,
+            minimum = 86400,
+        },
+        renew_check_interval = {
+            type = "number",
+            default = 6 * 3600,
+            minimum = 3600,
         },
     },
     required = {"account_email"},
@@ -103,6 +114,8 @@ function _M.init()
             },
         }
     }
+
+    acme_cache:set('stopped', 'true')
 end
 
 
@@ -126,12 +139,79 @@ local function init_account()
         if err then
             return 500, { error_msg = err }
         end
-        config.account_kid = client:new_account()
+        config.account_kid, err = client:new_account()
+        if err then
+            return 500, { error_msg = err }
+        end
         return 200, config
     end
     return 304, { error_msg = "plugin metadata for acme already initialized" }
 end
 
+local function order_certificate()
+end
+
+local function renew_check(premature, config)
+    if premature or acme_cache:get('stopped') == 'true' then
+        return
+    end
+
+    local ssl = require("apisix.admin.ssl")
+    -- secret key cleared bypass
+    local resource_name = ssl.name
+    ssl.name = 'ssl'
+    local _, ssls_resource = ssl:get()
+    if ssls_resource.count <= 0 then
+        core.log.debug("no ssl resource found")
+        return
+    end
+    -- recover for patch
+    ssl.name = resource_name
+
+    local ssls = ssls_resource.list
+    for _, item in ipairs(ssls) do
+        if not item.value.acme or not item.value.acme.acme_enabled then
+            core.log.debug(item.key, " is not managed by acme plugin, pass it")
+            return
+        end
+        local cert = x509.new(item.value.cert)
+        local now = ngx.now()
+        local _, not_after = cert:get_lifetime()
+        core.log.debug("cert renew check for: ", item.key, ", not after: ", os.date("%Y-%m-%d %H:%M:%S GMT", not_after))
+        if not_after - now < config.renew_threshold then
+            local new_cert, err = order_certificate(item.value.key, item.value.cert)
+            if err then
+                core.log.error("failed to renew cert: ", item.key, ", error: ", err)
+            end
+            local _, err = ssls_resource:patch(item.value.id, { cert = new_cert })
+            if err then
+                core.log.error("failed to patch resource: ", item.key, ", error: ", err)
+            end
+            core.log.info("resource: ", item.key, " renewed")
+        end
+    end
+end
+
+local function start_watch()
+    local metadata = plugin.plugin_metadata(plugin_name)
+    if not metadata or not metadata.value then
+        return 400, { error_msg = "plugin metadata for acme is required" }
+    end
+
+    local config = metadata.value
+    if not config.account_kid then
+        return 400, { error_msg = "plugin metadata for acme is not initialized" }
+    end
+
+    _, err = ngx.timer.every(config.renew_check_interval, renew_check, config)
+    if not err then
+        acme_cache:set('stopped', 'false')
+    end
+end
+
+local function stop_watch()
+    acme_cache:set('stopped', 'true')
+end
 
 function _M.control_api()
     return {
@@ -139,6 +219,16 @@ function _M.control_api()
             methods = {"POST"},
             uris = {"/v1/plugin/acme/init"},
             handler = init_account,
+        },
+        {
+            methods = {"POST"},
+            uris = {"/v1/plugin/acme/start"},
+            handler = start_watch,
+        },
+        {
+            methods = {"POST"},
+            uris = {"/v1/plugin/acme/stop"},
+            handler = stop_watch,
         },
     }
 end
