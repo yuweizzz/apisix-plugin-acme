@@ -110,8 +110,23 @@ function _M.init()
             challenge_handler = {
                 type = "string",
                 default = "http-01",
-                enum = {"http-01", "dns-01"},
+                enum = { "http-01", "dns-01" },
             },
+            dns_provider = {
+                type = object
+                properties = {
+                    provider = {
+                        type = "string",
+                        default = "cloudflare",
+                        -- provided by lua-resty-acme
+                        enum = { "cloudflare", "dynv6" },
+                    },
+                    secret = {
+                        type = "string",
+                    },
+                },
+                required = { "provider", "secret" },
+            }
         }
     }
 
@@ -135,7 +150,7 @@ local function init_account()
         if not client then
             return 500, { error_msg = err }
         end
-    	err = client:init()
+        err = client:init()
         if err then
             return 500, { error_msg = err }
         end
@@ -148,8 +163,64 @@ local function init_account()
     return 304, { error_msg = "plugin metadata for acme already initialized" }
 end
 
-local function order_certificate()
+
+local function renew_certificate(account_config, key, cert_ref)
+    local metadata = plugin.plugin_metadata(plugin_name)
+    if not metadata or not metadata.value then
+        return nil, "plugin metadata for acme is required"
+    end
+
+    if account_config.challenge_handler == "dns-01" and not account_config.dns_provider then
+        return nil, "dns_provider is required for dns-01 challenge"
+    end
+
+    local sn_obj = cert_ref:get_subject_name()
+    local san_obj = cert_ref:get_subject_alt_name()
+    local domain_list = {}
+    for _, obj in pairs(san_obj) do
+        table.insert(domain_list, obj)
+    end
+    core.log.debug("Raw SAN: ", core.json.delay_encode(domain_list))
+
+    local cn_obj, _, err = sn_obj:find("CN")
+    if err then
+        return nil, "find CN failed: " .. err
+    end
+    lcoal cn = cn_obj.blob
+    -- make sure CN same with raw cert
+    if domain_list[1] != cn then
+        local domain = domain_list[1]
+        domain_list[1] = cn
+        table.insert(domain_list, domain)
+    end
+    core.log.debug("Renewed SAN: ", core.json.delay_encode(domain_list))
+
+    local metadata_config = metadata.value
+    metadata_config.enabled_challenge_handlers = account_config.challenge_handler
+    metadata_config.dns_provider_accounts = {
+        {
+            name = account_config.dns_provider.provider,
+            provider = account_config.dns_provider.provider,
+            secret = account_config.dns_provider.secret,
+            domains = domain_list,
+        },
+    }
+    local client, err = acme.new(metadata_config)
+    if not client then
+        return nil, err
+    end
+    err = client:init()
+    if err then
+        return nil, err
+    end
+
+    local new_cert, err = client:order_certificate(key, unpack(domain_list))
+    if err then
+        return nil, err
+    end
+    return new_cert
 end
+
 
 local function renew_check(premature, config)
     if premature or acme_cache:get('stopped') == 'true' then
@@ -179,7 +250,9 @@ local function renew_check(premature, config)
         local _, not_after = cert:get_lifetime()
         core.log.debug("cert renew check for: ", item.key, ", not after: ", os.date("%Y-%m-%d %H:%M:%S GMT", not_after))
         if not_after - now < config.renew_threshold then
-            local new_cert, err = order_certificate(item.value.key, item.value.cert)
+            local apisix_ssl = require("apisix.ssl")
+            local raw_key = apisix_ssl.aes_decrypt_pkey(item.value.key)
+            local new_cert, err = renew_certificate(config, raw_key, cert)
             if err then
                 core.log.error("failed to renew cert: ", item.key, ", error: ", err)
             end
