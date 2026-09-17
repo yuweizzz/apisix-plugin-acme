@@ -286,6 +286,24 @@ local function stop_watch()
     acme_cache:set('stopped', 'true')
 end
 
+-- lua-resty-acme/lib/resty/acme/challenge/http-01.lua
+local function serve_http_challenge()
+    local captures, err = ngx.re.match(ngx.var.request_uri, [[/\.well-known/acme-challenge/(.+)]], "jo")
+
+    if err or not captures or not captures[1] then
+        core.response.exit(400, { error_msg = "error extracting token from request_uri: " .. err })
+    end
+    
+    local token = captures[1]
+    core.log.debug("http-01 challenge tokne: ", token)
+    local value, err = acme_cache:get(token .. "#http-01")
+    if not value then
+        core.response.exit(404, { error_msg = "no corresponding response found for " .. token })
+    end
+
+    core.response.exit(200, value)
+end
+
 function _M.control_api()
     return {
         {
@@ -306,6 +324,15 @@ function _M.control_api()
     }
 end
 
+function _M.api()
+    return {
+        {
+            methods = {"GET"},
+            uri = "/.well-known/acme-challenge/*",
+            handler = serve_http_challenge,
+        }
+    }
+end
 
 function _M.destroy()
     core.schema.ssl.properties.acme = nil
