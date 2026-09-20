@@ -20,17 +20,16 @@
 
 local require = require
 
-local ngx_process = require("ngx.process")
-local ngx_timer_every = ngx.timer.every
-
 local acme = require("resty.acme.client")
 local util = require("resty.acme.util")
 local x509 = require("resty.openssl.x509")
 
 local core = require("apisix.core")
 local plugin = require("apisix.plugin")
+local ssl = require("apisix.admin.ssl")
+local apisix_ssl = require("apisix.ssl")
 
-
+-- same with lua-resty-acme default storage name
 local plugin_name = "acme"
 local acme_cache = ngx.shared[plugin_name]
 
@@ -83,6 +82,7 @@ local _M = {
     metadata_schema = metadata_schema,
 }
 
+
 function _M.check_schema(conf, schema_type)
     if schema_type == core.schema.TYPE_METADATA then
         return core.schema.check(metadata_schema, conf)
@@ -103,7 +103,7 @@ function _M.init()
     core.schema.ssl.properties.acme = {
         type = "object",
         properties = {
-            acme_enabled = {
+            enabled = {
                 type = "boolean",
                 default = false,
             },
@@ -113,7 +113,7 @@ function _M.init()
                 enum = { "http-01", "dns-01" },
             },
             dns_provider = {
-                type = object
+                type = "object",
                 properties = {
                     provider = {
                         type = "string",
@@ -130,47 +130,13 @@ function _M.init()
         }
     }
 
-    acme_cache:set('stopped', 'true')
+    acme_cache:set("stopped", "true")
 end
 
 
-local function init_account()
-    local metadata = plugin.plugin_metadata(plugin_name)
-    if not metadata or not metadata.value then
-        return 400, { error_msg = "plugin metadata for acme is required" }
-    end
-
-    local config = metadata.value
-    if not config.account_key then
-        config.account_key = util.create_pkey(4096, "RSA")
-    end
-    if not config.account_kid then
-        -- storage in shm
-        local client, err = acme.new(config)
-        if not client then
-            return 500, { error_msg = err }
-        end
-        err = client:init()
-        if err then
-            return 500, { error_msg = err }
-        end
-        config.account_kid, err = client:new_account()
-        if err then
-            return 500, { error_msg = err }
-        end
-        return 200, config
-    end
-    return 304, { error_msg = "plugin metadata for acme already initialized" }
-end
-
-
-local function renew_certificate(account_config, key, cert_ref)
-    local metadata = plugin.plugin_metadata(plugin_name)
-    if not metadata or not metadata.value then
-        return nil, "plugin metadata for acme is required"
-    end
-
-    if account_config.challenge_handler == "dns-01" and not account_config.dns_provider then
+local function renew_certificate(metadata, acme_config, key, cert_ref)
+    -- check acme_config
+    if acme_config.challenge_handler == "dns-01" and not acme_config.dns_provider then
         return nil, "dns_provider is required for dns-01 challenge"
     end
 
@@ -186,26 +152,27 @@ local function renew_certificate(account_config, key, cert_ref)
     if err then
         return nil, "find CN failed: " .. err
     end
-    lcoal cn = cn_obj.blob
+    local cn = cn_obj.blob
     -- make sure CN same with raw cert
-    if domain_list[1] != cn then
+    if domain_list[1] ~= cn then
         local domain = domain_list[1]
         domain_list[1] = cn
         table.insert(domain_list, domain)
     end
     core.log.debug("Renewed SAN: ", core.json.delay_encode(domain_list))
 
-    local metadata_config = metadata.value
-    metadata_config.enabled_challenge_handlers = account_config.challenge_handler
-    metadata_config.dns_provider_accounts = {
-        {
-            name = account_config.dns_provider.provider,
-            provider = account_config.dns_provider.provider,
-            secret = account_config.dns_provider.secret,
-            domains = domain_list,
-        },
-    }
-    local client, err = acme.new(metadata_config)
+    metadata.enabled_challenge_handlers = { acme_config.challenge_handler }
+    if acme_config.dns_provider then
+        metadata.dns_provider_accounts = {
+            {
+                name = acme_config.dns_provider.provider,
+                provider = acme_config.dns_provider.provider,
+                secret = acme_config.dns_provider.secret,
+                domains = domain_list,
+            },
+        }
+    end
+    local client, err = acme.new(metadata)
     if not client then
         return nil, err
     end
@@ -222,13 +189,12 @@ local function renew_certificate(account_config, key, cert_ref)
 end
 
 
-local function renew_check(premature, config)
-    if premature or acme_cache:get('stopped') == 'true' then
+local function renew_check(premature, metadata)
+    if premature or acme_cache:get("stopped") == "true" then
         return
     end
 
-    local ssl = require("apisix.admin.ssl")
-    -- secret key cleared bypass
+    -- get ssl resource, and bypass secret key clear
     local resource_name = ssl.name
     ssl.name = 'ssl'
     local _, ssls_resource = ssl:get()
@@ -236,34 +202,66 @@ local function renew_check(premature, config)
         core.log.debug("no ssl resource found")
         return
     end
-    -- recover for patch
+    -- recover for patch ssl resource
     ssl.name = resource_name
 
     local ssls = ssls_resource.list
     for _, item in ipairs(ssls) do
-        if not item.value.acme or not item.value.acme.acme_enabled then
+        if not item.value.acme or not item.value.acme.enabled then
             core.log.debug(item.key, " is not managed by acme plugin, pass it")
-            return
+            goto continue
         end
+        local acme_config = item.value.acme
         local cert = x509.new(item.value.cert)
         local now = ngx.now()
         local _, not_after = cert:get_lifetime()
         core.log.debug("cert renew check for: ", item.key, ", not after: ", os.date("%Y-%m-%d %H:%M:%S GMT", not_after))
-        if not_after - now < config.renew_threshold then
-            local apisix_ssl = require("apisix.ssl")
+        if not_after - now < metadata.renew_threshold then
             local raw_key = apisix_ssl.aes_decrypt_pkey(item.value.key)
-            local new_cert, err = renew_certificate(config, raw_key, cert)
+            local new_cert, err = renew_certificate(metadata, acme_config, raw_key, cert)
             if err then
                 core.log.error("failed to renew cert: ", item.key, ", error: ", err)
             end
-            local _, err = ssls_resource:patch(item.value.id, { cert = new_cert })
-            if err then
-                core.log.error("failed to patch resource: ", item.key, ", error: ", err)
+            local code, body = ssl:patch(item.value.id, { cert = new_cert })
+            if code ~= 200 then
+                core.log.error("failed to patch resource: ", item.key, ", return: ", core.json.delay_encode(resp))
             end
             core.log.info("resource: ", item.key, " renewed")
         end
+::continue::
     end
 end
+
+
+local function init_account()
+    local metadata = plugin.plugin_metadata(plugin_name)
+    if not metadata or not metadata.value then
+        return 400, { error_msg = "plugin metadata for acme is required" }
+    end
+
+    local metadata_config = metadata.value
+    if metadata_config.account_kid then
+        return 304, { error_msg = "plugin metadata for acme already initialized" }
+    end
+    if not metadata_config.account_key then
+        metadata_config.account_key = util.create_pkey(4096, "RSA")
+    end
+    -- storage in shm: default_config = { storage_adapter = "shm", storage_config = { shm_name = "acme"} ... }
+    local client, err = acme.new(metadata_config)
+    if not client then
+        return 500, { error_msg = err }
+    end
+    err = client:init()
+    if err then
+        return 500, { error_msg = err }
+    end
+    metadata_config.account_kid, err = client:new_account()
+    if err then
+        return 500, { error_msg = err }
+    end
+    return 200, metadata_config
+end
+
 
 local function start_watch()
     local metadata = plugin.plugin_metadata(plugin_name)
@@ -271,31 +269,45 @@ local function start_watch()
         return 400, { error_msg = "plugin metadata for acme is required" }
     end
 
-    local config = metadata.value
-    if not config.account_kid then
+    local metadata_config = metadata.value
+    if not metadata_config.account_kid then
         return 400, { error_msg = "plugin metadata for acme is not initialized" }
     end
 
-    _, err = ngx.timer.every(config.renew_check_interval, renew_check, config)
+    local _, err = ngx.timer.every(metadata_config.renew_check_interval, renew_check, metadata_config)
     if not err then
-        acme_cache:set('stopped', 'false')
+        acme_cache:set("stopped", "false")
     end
 end
 
+
 local function stop_watch()
-    acme_cache:set('stopped', 'true')
+    acme_cache:set("stopped", "true")
 end
+
 
 -- lua-resty-acme/lib/resty/acme/challenge/http-01.lua
 local function serve_http_challenge()
     local captures, err = ngx.re.match(ngx.var.request_uri, [[/\.well-known/acme-challenge/(.+)]], "jo")
 
-    if err or not captures or not captures[1] then
+    if err then
         core.response.exit(400, { error_msg = "error extracting token from request_uri: " .. err })
     end
-    
+
+    if not captures or not captures[1] then
+        core.response.exit(400, { error_msg = "error extracting token from request_uri: no captures" })
+    end
+
     local token = captures[1]
-    core.log.debug("http-01 challenge tokne: ", token)
+    -- token (required, string):  A random value that uniquely identifies
+    -- the challenge.  This value MUST have at least 128 bits of entropy.
+    -- It MUST NOT contain any characters outside the base64url alphabet
+    -- and MUST NOT include base64 padding characters ("=").
+    -- 128/6 = 21.333, no Padding = 22, Padding = 24
+    if #token <= 21 then
+        core.response.exit(400, { error_msg = "illegal token" })
+    end
+    core.log.debug("http-01 challenge token: ", token)
     local value, err = acme_cache:get(token .. "#http-01")
     if not value then
         core.response.exit(404, { error_msg = "no corresponding response found for " .. token })
@@ -303,6 +315,7 @@ local function serve_http_challenge()
 
     core.response.exit(200, value)
 end
+
 
 function _M.control_api()
     return {
@@ -324,6 +337,7 @@ function _M.control_api()
     }
 end
 
+
 function _M.api()
     return {
         {
@@ -334,8 +348,10 @@ function _M.api()
     }
 end
 
+
 function _M.destroy()
     core.schema.ssl.properties.acme = nil
 end
+
 
 return _M
