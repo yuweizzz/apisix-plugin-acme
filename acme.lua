@@ -260,8 +260,8 @@ local function init_account()
 
     local metadata_config = metadata.value
     if metadata_config.account_kid then
-        return 304, { 
-          error_msg = "plugin metadata for acme already initialized"
+        return 200, { 
+          error_msg = "plugin metadata for acme already initialized, do nothing"
         }
     end
     if not metadata_config.account_key then
@@ -290,6 +290,13 @@ end
 
 
 local function start_watch()
+    local value, err = acme_cache:get("stopped")
+    if err then
+        return 500, { error_msg = err }
+    end
+    if value == "false" then
+        return 200, { msg = "acme timer is already running, do nothing" }
+    end
     local metadata = plugin.plugin_metadata(plugin_name)
     if not metadata or not metadata.value then
         return 400, { error_msg = "plugin metadata for acme is required" }
@@ -307,12 +314,22 @@ local function start_watch()
     )
     if not err then
         acme_cache:set("stopped", "false")
+        return 200, { msg = "acme timer now started" }
     end
+    return 500, { error_msg = err }
 end
 
 
 local function stop_watch()
+    local value, err = acme_cache:get("stopped")
+    if err then
+        return 500, { error_msg = err }
+    end
+    if value == "true" then
+        return 200, { msg = "acme timer is already stopped, do nothing" }
+    end
     acme_cache:set("stopped", "true")
+    return 200, { msg = "acme timer now stopped" }
 end
 
 

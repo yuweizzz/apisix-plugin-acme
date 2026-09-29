@@ -1,51 +1,25 @@
-# apisix-plugin-acme
-
-[English](./en.md) | [中文](./zh.md)
+<!--
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+-->
 
 ## 描述
 
 `acme` 插件可以定时检查 SSL 证书资源，并通过 ACME 协议进行自动更新。
-
-## Install
-
-修改 config.yaml 文件：
-
-```yaml
-# config.yaml
-# add
-nginx_config:
-  http_configuration_snippet: 'lua_shared_dict acme 20m;'
-# add
-plugins:
-- acme
-```
-
-安装依赖：
-
-```bash
-luarocks install lua-resty-acme --tree deps
-```
-
-安装插件文件：
-
-```bash
-# cd <apisix-source-code-directory>
-install acme.lua apisix/plugins/acme.lua
-```
-
-## CA
-
-自行选择需要使用的 CA ，这里只列出我使用过的 CA ，其中 Let's Encrypt 没有 EAB 要求， Google Trust Services 有 EAB 要求。
-
-Prod CA:
-
-- Let's Encrypt: https://acme-v02.api.letsencrypt.org/directory
-- Google Trust Services: https://dv.acme-v02.api.pki.goog/directory
-
-Test CA:
-
-- Let's Encrypt: https://acme-staging-v02.api.letsencrypt.org/directory
-- Google Trust Services: https://dv.acme-v02.test-api.pki.goog/directory
 
 ## 启用插件
 
